@@ -495,10 +495,6 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
             module.bias.data.zero_()
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (Rwkv7Model, Rwkv7ForCausalLM)):
-            module.gradient_checkpointing = value
-
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Model body
@@ -581,10 +577,12 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=next_state, hidden_states=None, attentions=None)
 
     def _gc_block(self, block, x, v_first, att_last, ffn_last, matrix, compute_dtype):
+        # _gradient_checkpointing_func is set on the module by gradient_checkpointing_enable()
+        # (the base PreTrainedModel._set_gradient_checkpointing walks submodules and injects it).
         def custom(*args):
             x, v_first, att_last, ffn_last, matrix = args
             return block(x, v_first, att_last, ffn_last, matrix, compute_dtype)
-        return torch.utils.checkpoint.checkpoint(custom, x, v_first, att_last, ffn_last, matrix, use_reentrant=False)
+        return self._gradient_checkpointing_func(custom, x, v_first, att_last, ffn_last, matrix)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
