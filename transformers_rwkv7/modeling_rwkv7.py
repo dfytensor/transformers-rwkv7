@@ -162,6 +162,52 @@ def _wkv7_cuda(r, w_pre, k, v, a, b, state):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# Optional fast path: fla (flash-linear-attention) Triton chunk kernel.
+# Works on Linux (triton) and Windows (triton-windows); auto-detected. This is the
+# fastest tier — chunked parallel WKV, ~10-30x over the pure-PyTorch loop on training.
+# ----------------------------------------------------------------------------------------------------------------------
+
+_FLA_CHUNK = None
+_FLA_TRIED = False
+
+
+def _fla_available() -> bool:
+    global _FLA_CHUNK, _FLA_TRIED
+    if _FLA_CHUNK is not None:
+        return True
+    if _FLA_TRIED or not torch.cuda.is_available():
+        return False
+    _FLA_TRIED = True
+    try:
+        from fla.ops.rwkv7 import chunk_rwkv7  # noqa: F401
+        _FLA_CHUNK = chunk_rwkv7
+        return True
+    except Exception:
+        return False
+
+
+def _wkv7_fla(r, w_pre, k, v, a, b, state):
+    """fla Triton chunk kernel. Inputs (B,T,H,N) half-precision; returns (out (B,T,H,N), state (B,H,N,N) fp32).
+
+    Convention: fla's ``w`` is the *log decay* (the kernel computes ``decay = exp(w)``).
+    Our pre-decay value ``w_pre`` yields ``decay = exp(-exp(w_pre))``, so we pass ``w = -exp(w_pre)``.
+    All inputs are coerced to a single dtype (fla's dot op requires uniform dtype; under
+    autocast the time-mix sub-tensors can be a bf16/fp32 mix).
+    """
+    dt = r.dtype
+    w_log = (-torch.exp(w_pre.float())).to(dt)  # log(decay) = -exp(w_pre)
+    out, new_state = _FLA_CHUNK(
+        r=r.to(dt).contiguous(), w=w_log.contiguous(),
+        k=k.to(dt).contiguous(), v=v.to(dt).contiguous(),
+        a=a.to(dt).contiguous(), b=b.to(dt).contiguous(),
+        scale=1.0,
+        initial_state=state.to(dt).contiguous() if state is not None else None,
+        output_final_state=True,
+    )
+    return out, new_state
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # Layers
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -310,14 +356,18 @@ class Rwkv7TimeMix(nn.Module):
         k = k * (1 + (a - 1) * self.k_a)
 
         # WKV-7: the "a" arg of the operator is -kk, the "b" arg is kk*a (see demo.py)
-        # Fast path: compiled CUDA kernel on GPU + fp16/bf16 weights (auto-detected).
-        # Fallback: pure-PyTorch fp32 loop (CPU, or fp32, or when nvcc unavailable).
-        use_cuda = (r.is_cuda and r.dtype in (torch.float16, torch.bfloat16)
-                    and _cuda_wkv7_available())
+        # Fast path tiers (auto-selected): fla Triton chunk > enhanced CUDA kernel > pure-PyTorch
+        use_half = r.dtype in (torch.float16, torch.bfloat16)
+        use_fla = (r.is_cuda and use_half and _fla_available())
+        use_cuda = (not use_fla and r.is_cuda and use_half and _cuda_wkv7_available())
         a_h = (-kk).view(B, T, H, N)
         b_h = (kk * a).view(B, T, H, N)
-        if use_cuda:
-            # kernel runs in the model's native half dtype; state is fp32 in/out
+        if use_fla:
+            out_h, new_state = _wkv7_fla(
+                r.view(B, T, H, N), w.view(B, T, H, N), k.view(B, T, H, N),
+                v.view(B, T, H, N), a_h, b_h, matrix_state)
+            out = out_h.view(B, T, C).to(x.dtype)
+        elif use_cuda:
             out_h, new_state = _wkv7_cuda(
                 r.view(B, T, H, N), w.view(B, T, H, N), k.view(B, T, H, N),
                 v.view(B, T, H, N), a_h, b_h, matrix_state)

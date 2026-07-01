@@ -26,7 +26,8 @@ makes it trainable with the full HuggingFace stack — `Trainer`, `PEFT` (LoRA),
 | **HF `Trainer`** (SFT backbone) | ✅ | loss 8.6→3.4 over 4 steps (`tests/test_trl.py`) |
 | **TRL `DPOTrainer`** (off-policy RLHF) | ✅ | DPO loss + rewards/chosen+rejected gathered (`tests/test_dpo.py`) |
 | **TRL `GRPOTrainer`** (on-policy RL + generation) | ✅ | generates in-loop, length reward 35.0→33.5 (`tests/test_grpo.py`) |
-| **Optional CUDA WKV kernel** (≈10× over pure PyTorch) | ⚠️ code-ready | compiles on Linux / Win+VS2022; auto-falls-back otherwise (`tests/test_cuda_kernel.py`) |
+| **fla chunk kernel** (≈50–145× over pure PyTorch) | ✅ | `flash-linear-attention` + Triton (Linux) / **triton-windows** (Windows). bsz=1 → **4200 tok/s** on RTX 4090 (`tests/test_fla.py`) |
+| **Optional CUDA WKV kernel** (nvcc jit) | ⚠️ code-ready | compiles on Linux / Win+VS2022; auto-falls-back otherwise (`tests/test_cuda_kernel.py`) |
 | Text generation via `model.generate` | ✅ | "The Eiffel tower is in the city of **Paris, France**" |
 
 All checks run green on **Windows / CPU** (the hardest platform for inference engines), confirming
@@ -38,15 +39,17 @@ The WKV-7 recurrence is the hot loop. Three tiers, auto-selected at runtime:
 
 | Path | When | Status |
 |---|---|---|
-| **Enhanced CUDA kernel** (`transformers_rwkv7/cuda/wkv7.cu`) | CUDA + fp16/bf16 + a working nvcc/MSVC toolchain | ⚠️ code-ready. Upstream `wkv7.cu` reworked to be dtype-templated (fp16/bf16) **and** to emit the final recurrent state, so it's a drop-in for both training and RNN-decode. Compiles on first CUDA use via `torch.utils.cpp_extension`. Falls back silently on compile failure. |
-| **fla chunk kernel** (`flash-linear-attention`) | Linux + Triton | planned (fla has `fla.ops.rwkv7`); not bundled — Triton has no Windows wheels |
+| **fla chunk kernel** (`flash-linear-attention` `fla.ops.rwkv7`) | CUDA + half + Triton (Linux) **or triton-windows** (Windows) | ✅ verified. **52–145× speedup** over pure PyTorch on RTX 4090 (0.1B, bf16): bsz=1/T=512 → 4200 tok/s, bsz=1/T=2048 → 47859 tok/s. Same code, both OSes. |
+| **Enhanced CUDA kernel** (`transformers_rwkv7/cuda/wkv7.cu`) | CUDA + half + working nvcc/MSVC | ⚠️ code-ready. Upstream `wkv7.cu` reworked to be dtype-templated (fp16/bf16) **and** to emit the final recurrent state, so it's a drop-in for both training and RNN-decode. Compiles on first CUDA use via `torch.utils.cpp_extension`. Falls back silently on compile failure. |
 | **Pure-PyTorch loop** | everywhere (CPU, GPU, any dtype) | ✅ default; the correctness reference |
 
-> **Note on this dev box (Win + RTX 4090D):** the enhanced CUDA kernel is written and correct,
-> but the installed toolchain (CUDA 13.1 + VS 2026 MSVC) makes `nvcc`'s `cudafe++` crash, and
-> Triton has no Windows wheel — so **both** GPU-accel paths are un-runnable *here*. They compile
-> and run on Linux or Win+VS2022. The package degrades to the pure-PyTorch path with no code
-> change. Baseline on this box (pure-PyTorch, bf16, 0.1B): ~400 tok/s for bsz=1.
+> **Triton on Windows:** install `triton-windows` (`pip install triton-windows`). It exposes the
+> standard `import triton`, so the **same fla kernel code runs on Windows and Linux with zero
+> changes**. Note: Python 3.10/3.11 have known Triton bugs that crash kernels — use **≥3.12**.
+
+> **This dev box (Win + RTX 4090D + Python 3.12):** fla verified working via `triton-windows`
+> 3.7.1 (it uses its own LLVM pipeline, bypassing the broken CUDA-13.1/VS2026 `nvcc cudafe++`).
+> The custom `wkv7.cu` still can't jit-compile here (nvcc crash) but fla covers the fast path.
 
 ## Why this direction
 
@@ -147,7 +150,7 @@ RNN path with `use_cache=True` for O(1)-per-step memory.
 - [x] Checkpoint converter (`convert_checkpoint.py`) + `AutoModelForCausalLM` registration
 - [x] Multi-size checkpoint auto-inference (0.1B / 0.4B verified)
 - [x] Enhanced CUDA WKV kernel (dtype-templated + state out) — code-ready, env-gated
-- [ ] fla chunk kernel integration (Linux + Triton) — `fla.ops.rwkv7`
+- [x] **fla chunk kernel integrated** (Triton / triton-windows) — 52-145x verified on RTX 4090
 - [ ] Gradient-checkpointing verification at scale + DeepSpeed ZeRO-2/3 config recipe
 - [ ] transformers 5.x loading-path compatibility (currently pinned to 4.x)
 
@@ -161,10 +164,11 @@ python tests/test_peft.py         # LoRA wrap / train / generate
 python tests/test_trl.py          # HF Trainer end-to-end (SFT)
 python tests/test_dpo.py          # TRL DPO (off-policy RLHF)
 python tests/test_grpo.py         # TRL GRPO (on-policy RL + in-loop generation)
+python tests/test_fla.py          # fla Triton fast path: align + 50-145x speedup (self-skips w/o triton)
 python tests/test_cuda_kernel.py  # enhanced CUDA kernel (self-skips if nvcc unavailable)
 ```
 
-All green on Windows/CPU + Windows/CUDA(bf16, pure-PyTorch path), 7/8 tests run without a GPU.
+All green on Windows/CPU + Windows/CUDA(bf16 via fla/triton-windows), 7/9 tests run without a GPU.
 
 ## References
 
