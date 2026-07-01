@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# CUDA extension build cache (torch cpp_extension jit compiles on use)
+torch_extensions/
+*.so
+*.pyd
+*.dll
+*.cuda.o
+*.o
+
+# Model weights / data — never commit (multi-GB)
+*.pth
+*.bin
+*.safetensors
+*.pt
+models/
+rwkv7-*-hf/
+misc/
+mmlu_*_dataset/
+
+# Test/training temp outputs
+_*out/
+_sft_out/
+_dpo_out/
+_grpo_out/
+tmp/
+
+# Logs / scratch
+*.log
+_compile*.txt
+_loadsrc.txt
+_spm.txt
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
