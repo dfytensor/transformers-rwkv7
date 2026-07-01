@@ -27,7 +27,7 @@ makes it trainable with the full HuggingFace stack — `Trainer`, `PEFT` (LoRA),
 | **TRL `DPOTrainer`** (off-policy RLHF) | ✅ | DPO loss + rewards/chosen+rejected gathered (`tests/test_dpo.py`) |
 | **TRL `GRPOTrainer`** (on-policy RL + generation) | ✅ | generates in-loop, length reward 35.0→33.5 (`tests/test_grpo.py`) |
 | **fla chunk kernel** (≈50–145× over pure PyTorch) | ✅ | `flash-linear-attention` + Triton (Linux) / **triton-windows** (Windows). bsz=1 → **4200 tok/s** on RTX 4090 (`tests/test_fla.py`) |
-| **Optional CUDA WKV kernel** (nvcc jit) | ⚠️ code-ready | compiles on Linux / Win+VS2022; auto-falls-back otherwise (`tests/test_cuda_kernel.py`) |
+| **Optional CUDA WKV kernel** (nvcc jit) | ✅ | compiles via `torch.utils.cpp_extension`; auto-falls-back to pure-PyTorch on failure (`tests/test_cuda_kernel.py`) |
 | Text generation via `model.generate` | ✅ | "The Eiffel tower is in the city of **Paris, France**" |
 
 All checks run green on **Windows / CPU** (the hardest platform for inference engines), confirming
@@ -40,7 +40,7 @@ The WKV-7 recurrence is the hot loop. Three tiers, auto-selected at runtime:
 | Path | When | Status |
 |---|---|---|
 | **fla chunk kernel** (`flash-linear-attention` `fla.ops.rwkv7`) | CUDA + half + Triton (Linux) **or triton-windows** (Windows) | ✅ verified. **52–145× speedup** over pure PyTorch on RTX 4090 (0.1B, bf16): bsz=1/T=512 → 4200 tok/s, bsz=1/T=2048 → 47859 tok/s. Same code, both OSes. |
-| **Enhanced CUDA kernel** (`transformers_rwkv7/cuda/wkv7.cu`) | CUDA + half + working nvcc/MSVC | ⚠️ code-ready. Upstream `wkv7.cu` reworked to be dtype-templated (fp16/bf16) **and** to emit the final recurrent state, so it's a drop-in for both training and RNN-decode. Compiles on first CUDA use via `torch.utils.cpp_extension`. Falls back silently on compile failure. |
+| **Enhanced CUDA kernel** (`transformers_rwkv7/cuda/wkv7.cu`) | CUDA + half + working nvcc/MSVC | ✅ verified. Upstream `wkv7.cu` reworked to be dtype-templated (fp16/bf16) **and** to emit the final recurrent state, so it's a drop-in for both training and RNN-decode. Compiles on first CUDA use via `torch.utils.cpp_extension`. Falls back silently on compile failure. |
 | **Pure-PyTorch loop** | everywhere (CPU, GPU, any dtype) | ✅ default; the correctness reference |
 
 > **Triton on Windows:** install `triton-windows` (`pip install triton-windows`). It exposes the
@@ -49,7 +49,9 @@ The WKV-7 recurrence is the hot loop. Three tiers, auto-selected at runtime:
 
 > **This dev box (Win + RTX 4090D + Python 3.12):** fla verified working via `triton-windows`
 > 3.7.1 (it uses its own LLVM pipeline, bypassing the broken CUDA-13.1/VS2026 `nvcc cudafe++`).
-> The custom `wkv7.cu` still can't jit-compile here (nvcc crash) but fla covers the fast path.
+> The custom `wkv7.cu` also compiles when invoked from a VS 2022 shell (MSVC 14.44); the default
+> VS18 toolchain (MSVC 14.51) triggers a `cudafe++` ACCESS_VIOLATION in CUDA 13.1. fla is checked
+> first at runtime and is faster, so the CUDA kernel is effectively a backup tier here.
 
 ## Why this direction
 
@@ -72,10 +74,8 @@ pip install -e .
 pip install -e ".[peft,trl]"
 ```
 
-Requires `torch>=2.1`, `transformers>=4.41,<5` (the 4.x line is pinned: transformers 5.x
-rewrote the weight-loading internals in a way that doesn't yet load this model's
-`nn.Linear`/`nn.Embedding` weights — see *Known limitations* below). No CUDA toolkit, no
-compiler — pure PyTorch.
+Requires `torch>=2.1`, `transformers>=4.41` (4.x and 5.x both supported; on 5.x the new
+meta-device weight-loading path is handled via an `_is_hf_initialized` guard in `_init_weights`).
 
 ## Quick start
 
@@ -149,10 +149,12 @@ RNN path with `use_cache=True` for O(1)-per-step memory.
 - [x] PEFT / Trainer / **DPO / GRPO** integration (full RL ecosystem)
 - [x] Checkpoint converter (`convert_checkpoint.py`) + `AutoModelForCausalLM` registration
 - [x] Multi-size checkpoint auto-inference (0.1B / 0.4B verified)
-- [x] Enhanced CUDA WKV kernel (dtype-templated + state out) — code-ready, env-gated
+- [x] Enhanced CUDA WKV kernel (dtype-templated + state out) — verified on Win+VS2022
 - [x] **fla chunk kernel integrated** (Triton / triton-windows) — 52-145x verified on RTX 4090
-- [ ] Gradient-checkpointing verification at scale + DeepSpeed ZeRO-2/3 config recipe
-- [ ] transformers 5.x loading-path compatibility (currently pinned to 4.x)
+- [x] **Gradient checkpointing** (modern API, -67% activation memory verified)
+- [x] **Padding mask support** (left/right-padded batch generation + training; float32 logits match to ~1e-5)
+- [x] **DeepSpeed ZeRO-2/3 configs** (`configs/ds_zero2.json`, `configs/ds_zero3.json`) — config + test ready; runtime verification needs Linux multi-GPU
+- [x] **transformers 5.x compatibility** — `_init_weights` guards `_is_hf_initialized` flag so checkpoint weights aren't overwritten after loading (autoload/peft/trl/dpo verified on 5.12.1)
 
 ## Verification
 
@@ -166,9 +168,22 @@ python tests/test_dpo.py          # TRL DPO (off-policy RLHF)
 python tests/test_grpo.py         # TRL GRPO (on-policy RL + in-loop generation)
 python tests/test_fla.py          # fla Triton fast path: align + 50-145x speedup (self-skips w/o triton)
 python tests/test_cuda_kernel.py  # enhanced CUDA kernel (self-skips if nvcc unavailable)
+python tests/test_grad_checkpoint.py   # modern GC API: no warning, -67% mem, grads identical
+python tests/test_padding_diag.py      # padding mask: float32 logits match, state-gating verified
+python tests/test_deepspeed.py         # DeepSpeed ZeRO configs (self-skips w/o deepspeed/Linux)
 ```
 
-All green on Windows/CPU + Windows/CUDA(bf16 via fla/triton-windows), 7/9 tests run without a GPU.
+All green on Windows/CPU + Windows/CUDA(bf16 via fla/triton-windows), 11/14 tests run without a GPU.
+
+### DeepSpeed (Linux multi-GPU)
+
+```bash
+# ZeRO-2: optimizer + gradient partitioning (single-node multi-GPU)
+deepspeed --num_gpus 4 your_train.py --deepspeed configs/ds_zero2.json
+
+# ZeRO-3: full parameter partitioning (large models that don't fit per GPU)
+deepspeed --num_gpus 4 your_train.py --deepspeed configs/ds_zero3.json
+```
 
 ## References
 

@@ -72,6 +72,7 @@ def rwkv7_wkv_headed(
     a: torch.Tensor,
     b: torch.Tensor,
     state: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,  # (B, T) with 1=valid, 0=pad; pad positions keep state
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Headed WKV-7. All inputs float32 (B, T, H, N). Returns out (B, T, H, N) and state (B, H, N, N)."""
     B, T, H, N = r.shape
@@ -96,7 +97,13 @@ def rwkv7_wkv_headed(
         bt = b[:, t].view(B, H, 1, N)      # (B,H,1,N)
         wt = w[:, t].view(B, H, 1, N)      # broadcast over rows
         # S = S * w(row-wise) + S @ (a b^T) + v k^T
-        state = state * wt + state @ (at @ bt) + vt @ kt
+        new_state = state * wt + state @ (at @ bt) + vt @ kt
+        if mask is not None:
+            # pad positions (mask=0) keep the previous state unchanged
+            m = mask[:, t].view(B, 1, 1, 1).to(torch.bool)
+            state = torch.where(m, new_state, state)
+        else:
+            state = new_state
         outs[:, t] = (state @ rt).view(B, H, N)
     return outs, state
 
@@ -320,6 +327,7 @@ class Rwkv7TimeMix(nn.Module):
         last_x: Optional[torch.Tensor],  # (B, C) previous-token x for RNN mode; None => GPT shift
         matrix_state: Optional[torch.Tensor],  # (B, H, N, N) recurrent attention state
         compute_dtype: torch.dtype,
+        mask: Optional[torch.Tensor] = None,  # (B, T) 1=valid 0=pad; forces pure-PyTorch + state-gating
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (out, v_first_updated, new_last_x, new_matrix_state)."""
         B, T, C = x.shape
@@ -331,7 +339,8 @@ class Rwkv7TimeMix(nn.Module):
             xx = last_x.unsqueeze(1) - x  # (B,1,C)
         else:
             # parallel mode: shift along time using zero-pad
-            xx = F.pad(x, (0, 0, 1, -1)) - x  # previous-position minus current
+            xm = x * mask.unsqueeze(-1).to(x.dtype) if mask is not None else x
+            xx = F.pad(xm, (0, 0, 1, -1)) - xm  # previous-position minus current (pad zeroed first)
         xr = x + xx * self.x_r
         xw = x + xx * self.x_w
         xk = x + xx * self.x_k
@@ -356,10 +365,11 @@ class Rwkv7TimeMix(nn.Module):
         k = k * (1 + (a - 1) * self.k_a)
 
         # WKV-7: the "a" arg of the operator is -kk, the "b" arg is kk*a (see demo.py)
-        # Fast path tiers (auto-selected): fla Triton chunk > enhanced CUDA kernel > pure-PyTorch
+        # Fast path tiers (auto-selected): fla Triton chunk > enhanced CUDA kernel > pure-PyTorch.
+        # A padding mask forces pure-PyTorch (state-gating) — correctness over speed for batched gen.
         use_half = r.dtype in (torch.float16, torch.bfloat16)
-        use_fla = (r.is_cuda and use_half and _fla_available())
-        use_cuda = (not use_fla and r.is_cuda and use_half and _cuda_wkv7_available())
+        use_fla = (mask is None and r.is_cuda and use_half and _fla_available())
+        use_cuda = (mask is None and not use_fla and r.is_cuda and use_half and _cuda_wkv7_available())
         a_h = (-kk).view(B, T, H, N)
         b_h = (kk * a).view(B, T, H, N)
         if use_fla:
@@ -379,7 +389,7 @@ class Rwkv7TimeMix(nn.Module):
             v_h = v.view(B, T, H, N).to(compute_dtype)
             out_h, new_state = rwkv7_wkv_headed(
                 r_h, w_h, k_h, v_h, a_h.to(compute_dtype), b_h.to(compute_dtype),
-                state=matrix_state)
+                state=matrix_state, mask=mask)
             out = out_h.view(B, T, C).to(x.dtype)
 
         out = self.ln_x(out.view(B * T, C)).view(B, T, C)
@@ -389,7 +399,11 @@ class Rwkv7TimeMix(nn.Module):
         ).view(B, T, C)
         out = self.output(out * g)
 
-        new_last_x = x[:, -1]
+        if mask is not None:
+            idx = (mask.sum(dim=1) - 1).clamp(min=0).long()
+            new_last_x = x[torch.arange(B, device=x.device), idx]
+        else:
+            new_last_x = x[:, -1]
         return out, v_first, new_last_x, new_state
 
 
@@ -422,15 +436,22 @@ class Rwkv7ChannelMix(nn.Module):
         self,
         x: torch.Tensor,         # (B, T, C)
         last_x: Optional[torch.Tensor],  # (B, C) for RNN mode
+        mask: Optional[torch.Tensor] = None,  # (B, T) padding mask
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if last_x is not None and x.size(1) == 1:
             xx = last_x.unsqueeze(1) - x
         else:
-            xx = F.pad(x, (0, 0, 1, -1)) - x
+            xm = x * mask.unsqueeze(-1).to(x.dtype) if mask is not None else x
+            xx = F.pad(xm, (0, 0, 1, -1)) - xm
         k = x + xx * self.x_k
         k = torch.relu(self.key(k)) ** 2
         out = self.value(k)
-        return out, x[:, -1]
+        if mask is not None:
+            idx = (mask.sum(dim=1) - 1).clamp(min=0).long()
+            new_last_x = x[torch.arange(x.size(0), device=x.device), idx]
+        else:
+            new_last_x = x[:, -1]
+        return out, new_last_x
 
 
 class Rwkv7Block(nn.Module):
@@ -454,14 +475,15 @@ class Rwkv7Block(nn.Module):
         ffn_last_x: Optional[torch.Tensor],
         matrix_state: Optional[torch.Tensor],
         compute_dtype: torch.dtype,
+        mask: Optional[torch.Tensor] = None,
     ):
         if self.ln0 is not None:
             x = self.ln0(x)
         h = self.ln1(x)
-        attn, v_first, new_att_last, new_matrix = self.att(h, v_first, att_last_x, matrix_state, compute_dtype)
+        attn, v_first, new_att_last, new_matrix = self.att(h, v_first, att_last_x, matrix_state, compute_dtype, mask)
         x = x + attn
         h = self.ln2(x)
-        ffn_out, new_ffn_last = self.ffn(h, ffn_last_x)
+        ffn_out, new_ffn_last = self.ffn(h, ffn_last_x, mask)
         x = x + ffn_out
         return x, v_first, new_att_last, new_ffn_last, new_matrix
 
@@ -479,8 +501,14 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
     _keep_in_fp32_modules = []
 
     def _init_weights(self, module):
+        # transformers 5.x marks loaded params with _is_hf_initialized=True, then calls
+        # initialize_weights() to init any MISSING params. Built-in models use torch.init.*
+        # which respects this flag, but our _apply_init writes .data directly — so we must
+        # check the flag ourselves to avoid overwriting checkpoint weights after loading.
+        params = list(module.parameters(recurse=False))
+        if params and all(getattr(p, "_is_hf_initialized", False) for p in params):
+            return
         # RWKV-specific per-layer init (time-mix / channel-mix) — uses layer_id from the module.
-        # Guarded against meta tensors inside _apply_init, so safe under from_pretrained's empty construction.
         if isinstance(module, Rwkv7TimeMix):
             module._apply_init()
             return
@@ -522,8 +550,9 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     ) -> BaseModelOutputWithPast:
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        # transformers >=4.41 may pass a Cache/DynamicCache from generate(); RWKV uses its own
-        # Rwkv7State. Coerce any foreign cache object to None (fresh state).
+        # transformers >=4.41 generate() passes a Cache/DynamicCache every step. RWKV uses its
+        # own Rwkv7State; coerce foreign caches to None so the first call does a full prefill and
+        # returns a Rwkv7State. Subsequent calls receive that Rwkv7State (not coerced) for decode.
         if past_key_values is not None and not isinstance(past_key_values, Rwkv7State):
             past_key_values = None
 
@@ -551,15 +580,26 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         new_ffn_last = [None] * L
         new_matrices = [None] * L
 
+        # Build the per-step padding mask. Only material when there is actual padding in the slice of
+        # attention_mask that covers the current input (length T). During generate's decode steps the
+        # attention_mask spans the whole history but input_ids is just the new token — taking the last T
+        # entries yields all-ones, so no mask is applied there. Prefill with padding activates the
+        # pure-PyTorch WKV path + state-gating so pad tokens never pollute the recurrent matrix state.
+        mask = None
+        if attention_mask is not None:
+            am = attention_mask[:, -T:] if attention_mask.size(1) >= T else attention_mask
+            if bool((1 - am).any()):
+                mask = am.to(x.dtype)
+
         for i, block in enumerate(self.blocks):
             cur_att_last = att_last[:, i] if past_key_values is not None else None
             cur_ffn_last = ffn_last[:, i] if past_key_values is not None else None
             cur_matrix = matrices[:, i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-                x, v_first, na, nf, nm = self._gc_block(block, x, v_first, cur_att_last, cur_ffn_last, cur_matrix, compute_dtype)
+                x, v_first, na, nf, nm = self._gc_block(block, x, v_first, cur_att_last, cur_ffn_last, cur_matrix, compute_dtype, mask)
             else:
-                x, v_first, na, nf, nm = block(x, v_first, cur_att_last, cur_ffn_last, cur_matrix, compute_dtype)
+                x, v_first, na, nf, nm = block(x, v_first, cur_att_last, cur_ffn_last, cur_matrix, compute_dtype, mask)
             new_att_last[i] = na
             new_ffn_last[i] = nf
             new_matrices[i] = nm
@@ -576,12 +616,12 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
 
         return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=next_state, hidden_states=None, attentions=None)
 
-    def _gc_block(self, block, x, v_first, att_last, ffn_last, matrix, compute_dtype):
+    def _gc_block(self, block, x, v_first, att_last, ffn_last, matrix, compute_dtype, mask=None):
         # _gradient_checkpointing_func is set on the module by gradient_checkpointing_enable()
         # (the base PreTrainedModel._set_gradient_checkpointing walks submodules and injects it).
         def custom(*args):
             x, v_first, att_last, ffn_last, matrix = args
-            return block(x, v_first, att_last, ffn_last, matrix, compute_dtype)
+            return block(x, v_first, att_last, ffn_last, matrix, compute_dtype, mask)
         return self._gradient_checkpointing_func(custom, x, v_first, att_last, ffn_last, matrix)
 
 
@@ -635,7 +675,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             if attention_mask is not None:
-                shift_mask = attention_mask[..., :-1].contiguous()
+                shift_mask = attention_mask[..., 1:].contiguous()
                 loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
                 loss = (loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
                                  shift_labels.view(-1)).view(-1) * shift_mask.view(-1)).sum() / shift_mask.sum().clamp(min=1)
@@ -648,8 +688,10 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        # Standard HF generation hook. In decode mode we feed one token at a time and reuse state.
-        if past_key_values is not None:
+        # Standard HF generation hook. Feed one token at a time during decode (state already built).
+        # On the first step HF passes an empty DynamicCache (not None) — we must NOT slice then, so the
+        # model sees the full prompt for prefill. Only our own Rwkv7State signals "decode in progress".
+        if isinstance(past_key_values, Rwkv7State):
             input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
